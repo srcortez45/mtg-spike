@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prueba de carga del catálogo</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+  body { max-width: 640px; margin: 0 auto; padding: 16px; line-height: 1.4; }
+  button, input { font: inherit; padding: 8px 12px; margin: 4px 4px 4px 0; }
+  input { width: 100%; box-sizing: border-box; }
+  pre { white-space: pre-wrap; font-size: 13px; }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/dexie@4.0.8/dist/dexie.min.js"></script>
+</head>
+<body>
+<h1>Prueba de carga del catálogo</h1>
+<p>Sets a cargar (vacío = todos), separados por coma, por ejemplo: <code>soc,fin,mh3</code></p>
+<input id="sets" placeholder="todos">
+<div>
+  <button id="load">Cargar</button>
+  <button id="query">Probar consultas</button>
+  <button id="clear">Borrar base</button>
+</div>
+<pre id="log"></pre>
+<script>
+const db = new Dexie('mtg-spike');
+db.version(1).stores({ printings: 'id, [set_code+collector_number], oracle_id, name, set_code' });
+
+const out = document.getElementById('log');
+const log = msg => { out.textContent += msg + '\n'; };
+const mb = n => (n / 1e6).toFixed(1) + ' MB';
+
+// GitHub Pages sirve .gz sin Content-Encoding: hay que descomprimir a mano.
+// Si un servidor local ya lo descomprimió, se usa tal cual.
+async function readSet(set) {
+  const buf = await (await fetch(`catalog/${set.file}`)).arrayBuffer();
+  const bytes = new Uint8Array(buf);
+  if (bytes[0] !== 0x1f || bytes[1] !== 0x8b) return JSON.parse(new TextDecoder().decode(bytes));
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+  return JSON.parse(await new Response(stream).text());
+}
+
+document.getElementById('load').onclick = async () => {
+  out.textContent = '';
+  const persisted = navigator.storage?.persist ? await navigator.storage.persist() : 'no disponible';
+  log(`Almacenamiento persistente: ${persisted}`);
+
+  const index = await (await fetch('catalog/index.json')).json();
+  const wanted = document.getElementById('sets').value.split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+  const sets = wanted.length ? index.sets.filter(s => wanted.includes(s.code)) : index.sets;
+  log(`Sets: ${sets.length} · descarga estimada: ${mb(sets.reduce((n, s) => n + s.bytes, 0))}`);
+
+  const t0 = performance.now();
+  let done = 0, cards = 0;
+  const queue = [...sets];
+  const worker = async () => {
+    while (queue.length) {
+      const set = queue.shift();
+      const rows = await readSet(set);
+      await db.printings.bulkPut(rows);
+      cards += rows.length;
+      if (++done % 50 === 0) log(`  ${done}/${sets.length} sets, ${cards} impresiones…`);
+    }
+  };
+  await Promise.all([worker(), worker(), worker(), worker()]);
+
+  log(`Listo: ${cards} impresiones en ${((performance.now() - t0) / 1000).toFixed(1)} s`);
+  const est = await navigator.storage?.estimate?.();
+  if (est) log(`Uso de almacenamiento: ${mb(est.usage)} de ${mb(est.quota)}`);
+};
+
+document.getElementById('query').onclick = async () => {
+  let t = performance.now();
+  const sol = await db.printings.get({ set_code: 'soc', collector_number: '128' });
+  log(`Búsqueda por set + número (soc 128): ${sol?.name ?? 'no encontrada'} en ${(performance.now() - t).toFixed(1)} ms`);
+
+  t = performance.now();
+  const hits = await db.printings.where('name').startsWithIgnoreCase('sol').limit(20).toArray();
+  log(`Autocompletado "sol": ${hits.length} resultados en ${(performance.now() - t).toFixed(1)} ms`);
+
+  t = performance.now();
+  const total = await db.printings.count();
+  log(`Conteo total: ${total} en ${(performance.now() - t).toFixed(1)} ms`);
+};
+
+document.getElementById('clear').onclick = async () => {
+  await db.delete();
+  await db.open();
+  out.textContent = 'Base borrada.\n';
+};
+</script>
+</body>
+</html>
